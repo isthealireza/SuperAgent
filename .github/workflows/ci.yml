@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      node: ${{ steps.detect.outputs.node }}
+      python: ${{ steps.detect.outputs.python }}
+      go: ${{ steps.detect.outputs.go }}
+      rust: ${{ steps.detect.outputs.rust }}
+      unsupported: ${{ steps.detect.outputs.unsupported }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check patch whitespace
+        if: github.event_name == 'pull_request'
+        run: git diff --check "origin/${GITHUB_BASE_REF}...HEAD"
+      - name: Validate shell script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=$(git ls-files '*.sh')
+          if [[ -n "$files" ]]; then while IFS= read -r file; do bash -n "$file"; done <<< "$files"; fi
+      - id: detect
+        name: Detect project type
+        shell: bash
+        run: |
+          node=false
+          python=false
+          go=false
+          rust=false
+          unsupported=false
+
+          [[ -f package.json ]] && node=true
+          [[ -f pyproject.toml || -f requirements.txt || -f setup.py ]] && python=true
+          [[ -f go.mod ]] && go=true
+          [[ -f Cargo.toml ]] && rust=true
+
+          if git ls-files | grep -Eq '\.(java|kt|cs|php|rb|swift|c|h|cc|cpp|hpp)$'; then
+            unsupported=true
+          elif [[ "$node" == false && "$python" == false && "$go" == false && "$rust" == false ]]; then
+            if git ls-files | grep -Eq '\.(js|jsx|mjs|cjs|ts|tsx|py|go|rs)$'; then unsupported=true; fi
+          fi
+
+          {
+            echo "node=$node"
+            echo "python=$python"
+            echo "go=$go"
+            echo "rust=$rust"
+            echo "unsupported=$unsupported"
+          } >> "$GITHUB_OUTPUT"
+
+  node:
+    needs: detect
+    if: needs.detect.outputs.node == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install and run available checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          manager=$(node -e "const fs=require('fs'),p=require('./package.json'); const declared=p.packageManager?.split('@')[0]; console.log(declared || (fs.existsSync('pnpm-lock.yaml') ? 'pnpm' : fs.existsSync('yarn.lock') ? 'yarn' : 'npm'))")
+          version=$(node -e "const p=require('./package.json'); console.log(p.packageManager?.split('@')[1]?.split('+')[0] || '')")
+
+          case "$manager" in
+            pnpm)
+              npm install --global "pnpm${version:+@$version}"
+              pnpm install --frozen-lockfile
+              runner=pnpm
+              ;;
+            yarn)
+              npm install --global "yarn${version:+@$version}"
+              yarn install --frozen-lockfile
+              runner=yarn
+              ;;
+            npm)
+              if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then npm ci; else npm install; fi
+              runner=npm
+              ;;
+            *)
+              echo "Unsupported Node package manager: $manager" >&2
+              exit 1
+              ;;
+          esac
+
+          found=false
+          for script in check test build; do
+            if node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)"; then
+              found=true
+              "$runner" run "$script"
+            fi
+          done
+          if [[ "$found" == false ]]; then
+            echo "Add a check, test, or build script to package.json." >&2
+            exit 1
+          fi
+
+  python:
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.x'
+      - name: Install and run available checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then python -m pip install -r requirements.txt; fi
+          if [[ -f pyproject.toml ]]; then python -m pip install -e .; fi
+          if [[ -d tests ]] || compgen -G 'test_*.py' > /dev/null; then
+            python -m pip install pytest
+            python -m pytest -q
+          else
+            python -m compileall -q .
+          fi
+
+  go:
+    needs: detect
+    if: needs.detect.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run Go tests
+        run: go test ./...
+
+  rust:
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v2.0.1
+      - name: Run Rust tests
+        run: cargo test --workspace --all-targets
+
+  ci:
+    name: ci
+    if: always()
+    needs: [detect, node, python, go, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require supported code and passing checks
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          NODE_RESULT: ${{ needs.node.result }}
+          PYTHON_RESULT: ${{ needs.python.result }}
+          GO_RESULT: ${{ needs.go.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          UNSUPPORTED: ${{ needs.detect.outputs.unsupported }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DETECT_RESULT" == success ]] || { echo "Project detection failed." >&2; exit 1; }
+          [[ "$UNSUPPORTED" != true ]] || { echo "No CI adapter exists for this code yet; add its test command before merging." >&2; exit 1; }
+          for result in "$NODE_RESULT" "$PYTHON_RESULT" "$GO_RESULT" "$RUST_RESULT"; do
+            [[ "$result" == success || "$result" == skipped ]] || { echo "A project check failed." >&2; exit 1; }
+          done
