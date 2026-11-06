@@ -46,6 +46,17 @@ systemctl --user status dsh-superagent.service
 
 The Router binds to `127.0.0.1` by default. To receive GitHub webhooks, expose that endpoint through a TLS-terminating reverse proxy or tunnel and set the same random secret in GitHub and `.env`. Do not expose the Router without HTTPS and webhook signature validation.
 
+### Windows startup
+
+The service runs in Ubuntu WSL but is managed from Windows. To keep WSL running after the first PowerShell command exits, copy the included hidden launcher into the current Windows user's Startup folder:
+
+```powershell
+$startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+Copy-Item '\\wsl.localhost\Ubuntu\home\alpha\src\SuperAgent\deploy\keep-wsl-alive.vbs' (Join-Path $startup 'DeepSeekSuperAgent.vbs')
+```
+
+At the next Windows sign-in, it starts Ubuntu WSL hidden; the enabled Docker and Router user services start with it. Health is available from Windows at `http://localhost:3088/health`.
+
 ## Configuration
 
 | Variable | Purpose |
