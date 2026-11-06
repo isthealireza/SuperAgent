@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { publishSuccessfulTask } from './github.mjs';
 
 const execFile = promisify(execFileCb);
 const imageName = 'dsh-superagent-worker:local';
@@ -136,7 +137,7 @@ export async function startModelProxy(cfg, task) {
   }
 }
 
-function containerArgs(cfg, task, worktree, privateNetwork) {
+function containerArgs(cfg, task, worktree, privateNetwork, sessionStateDir) {
   // The official DSH native addon loader materializes its N-API module in /tmp
   // before dlopen, so only DSH needs an executable bounded temp mount.
   const tempMountOptions = cfg.engine === 'dsh'
@@ -164,25 +165,29 @@ function containerArgs(cfg, task, worktree, privateNetwork) {
     '--env', `FIXTURE_REPLACEMENT=${task.fixtureReplacement ?? ''}`,
     '--env', `SMOKE_NETWORK_PROBE=${task.smokeNetworkProbe ? 'true' : 'false'}`,
   ];
+  if (cfg.engine === 'dsh') {
+    args.push('--mount', `type=bind,src=${sessionStateDir},dst=/home/agent/.dsh`);
+    args.push('--env', `DSH_SESSION_ID=${task.sessionId}`);
+  }
   if (cfg.engine === 'claude') args.push('--env', 'ANTHROPIC_API_KEY=dsh-router-proxy');
   if (cfg.engine === 'dsh') args.push('--env', 'DEEPSEEK_API_KEY=dsh-router-proxy');
   args.push(imageName);
   return args;
 }
 
-async function setWorktreeOwner(worktree, uid) {
+async function setWorktreeOwner(worktree, uid, { privateFiles = false } = {}) {
   const args = [
     'run', '--rm', '--network', 'none', '--read-only', '--user', '0:0', '--memory', '256m', '--cpus', '0.25', '--pids-limit', '32',
     '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges=true',
+    ...(privateFiles ? ['--cap-add', 'DAC_OVERRIDE'] : []),
     '--mount', `type=bind,src=${worktree},dst=/workspace`,
     '--entrypoint', 'chown', imageName, '-R', `${uid}:${uid}`, '/workspace',
   ];
   await execFile('docker', args, { maxBuffer: 100_000, timeout: 120_000 });
 }
 
-async function createPullRequest(cfg, branch, title, body) {
-  if (!cfg.createPullRequest) return null;
-  if (!cfg.githubToken || !cfg.githubOwner || !cfg.githubRepo) throw new Error('CREATE_PULL_REQUEST requires GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO');
+async function pushBranch(cfg, repo, branch) {
+  if (!cfg.githubToken) throw new Error('GITHUB_TOKEN is required for the router-side branch push');
   const remote = await git(cfg.repoPath, ['remote', 'get-url', 'origin']);
   if (!remote.startsWith('https://github.com/')) throw new Error('PR publishing is restricted to an https://github.com/ origin');
   const encoded = Buffer.from(`x-access-token:${cfg.githubToken}`).toString('base64');
@@ -194,38 +199,37 @@ async function createPullRequest(cfg, branch, title, body) {
     GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${encoded}`,
   };
   await execFile('git', ['-C', cfg.repoPath, 'push', 'origin', `${branch}:${branch}`], { env: pushEnv, timeout: 120_000 });
-  const base = (await git(cfg.repoPath, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).catch(() => 'origin/main')).replace(/^origin\//, '');
-  const response = await fetch(`https://api.github.com/repos/${cfg.githubOwner}/${cfg.githubRepo}/pulls`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${cfg.githubToken}`, accept: 'application/vnd.github+json', 'content-type': 'application/json', 'x-github-api-version': '2022-11-28' },
-    body: JSON.stringify({ title, head: branch, base, body, draft: true }),
-    signal: AbortSignal.timeout(20000),
-  });
-  const result = await response.json();
-  if (!response.ok) throw new Error(`GitHub PR API returned ${response.status}: ${result.message ?? 'unknown error'}`);
-  return result.html_url;
 }
 
 export async function runWorker(cfg, task, { projectRoot }) {
   await ensureImage(projectRoot);
   const id = slug(task.id);
   const privateNetwork = taskNetwork(id);
-  const branch = `agent/task-${id}`;
+  const issuePart = Number.isSafeInteger(task.issueNumber) ? task.issueNumber : id;
+  const branch = task.ticketBranch ?? `agent/task-${issuePart}-${Date.now()}`;
   const worktree = path.join(cfg.worktreesDir, id);
+  const sessionStateDir = path.join(cfg.sessionStateDir, slug(task.ticketId ?? id));
   await mkdir(cfg.worktreesDir, { recursive: true });
   await mkdir(cfg.artifactsDir, { recursive: true });
+  if (cfg.engine === 'dsh') await mkdir(sessionStateDir, { recursive: true, mode: 0o700 });
   const repo = path.resolve(cfg.repoPath);
   const dirty = await git(repo, ['status', '--porcelain']);
   if (dirty) throw new Error('Repository checkout has uncommitted changes; refusing to create a worker worktree');
-  await git(repo, ['worktree', 'add', '-b', branch, worktree, 'HEAD']);
+  const existingBranch = await git(repo, ['branch', '--list', '--format=%(refname:short)', branch]);
+  await git(repo, existingBranch ? ['worktree', 'add', worktree, branch] : ['worktree', 'add', '-b', branch, worktree, 'HEAD']);
   const gitPointer = await readFile(path.join(worktree, '.git'));
   let ownerShifted = false;
+  let sessionOwnerShifted = false;
   let proxyId = null;
   try {
     proxyId = await startModelProxy(cfg, task);
     ownerShifted = true;
     await setWorktreeOwner(worktree, 10001);
-    const args = containerArgs(cfg, task, worktree, privateNetwork);
+    if (cfg.engine === 'dsh') {
+      sessionOwnerShifted = true;
+      await setWorktreeOwner(sessionStateDir, 10001, { privateFiles: true });
+    }
+    const args = containerArgs(cfg, task, worktree, privateNetwork, sessionStateDir);
     const childEnv = {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -239,6 +243,10 @@ export async function runWorker(cfg, task, { projectRoot }) {
     });
     await setWorktreeOwner(worktree, 0);
     ownerShifted = false;
+    if (sessionOwnerShifted) {
+      await setWorktreeOwner(sessionStateDir, 0, { privateFiles: true });
+      sessionOwnerShifted = false;
+    }
     const { stdout: inspectJson } = await execFile('docker', ['inspect', `dsh-worker-${id}`], { maxBuffer: 200_000 });
     const inspect = JSON.parse(inspectJson)[0];
     const bindMounts = inspect.Mounts.filter(mount => mount.Type === 'bind');
@@ -247,8 +255,9 @@ export async function runWorker(cfg, task, { projectRoot }) {
     if (inspect.Config.User !== '10001:10001' || !hardening.ReadonlyRootfs || hardening.PidsLimit !== cfg.pids
       || hardening.Memory <= 0 || hardening.NanoCpus <= 0 || !hardening.CapDrop.includes('ALL')
       || !hardening.SecurityOpt.includes('no-new-privileges=true') || hardening.NetworkMode !== expectedNetwork
-      || bindMounts.length !== 1 || path.resolve(bindMounts[0].Source) !== path.resolve(worktree)
-      || bindMounts[0].Destination !== '/workspace') {
+      || bindMounts.length !== (cfg.engine === 'dsh' ? 2 : 1)
+      || !bindMounts.some(mount => path.resolve(mount.Source) === path.resolve(worktree) && mount.Destination === '/workspace')
+      || (cfg.engine === 'dsh' && !bindMounts.some(mount => path.resolve(mount.Source) === path.resolve(sessionStateDir) && mount.Destination === '/home/agent/.dsh'))) {
       throw new Error('Worker container failed the isolation and resource policy inspection');
     }
     console.log(`SANDBOX_VERIFIED: uid=${inspect.Config.User} network=${hardening.NetworkMode} memory=${hardening.Memory} nanoCpus=${hardening.NanoCpus} pids=${hardening.PidsLimit} bindMounts=${bindMounts.length} readonlyRoot=${hardening.ReadonlyRootfs}`);
@@ -259,17 +268,21 @@ export async function runWorker(cfg, task, { projectRoot }) {
     void staged;
     const changes = await git(worktree, ['diff', '--cached', '--name-only']);
     if (!changes) throw new Error('Worker completed without producing a tracked patch');
-    const commitTitle = `agent(task): ${slug(task.title).replaceAll('-', ' ')}`.slice(0, 72);
+    const commitDetails = slug(task.title).replaceAll('-', ' ');
+    const commitTitle = `fix(agent): ${commitDetails.slice(0, 72 - 'fix(agent):  [skip ci]'.length)} [skip ci]`;
     await git(worktree, ['-c', 'user.name=DeepSeek Super Agent', '-c', 'user.email=superagent@users.noreply.github.com', 'commit', '-m', commitTitle]);
     const patch = await git(worktree, ['show', '--format=', '--binary', 'HEAD']);
     if (!patch) throw new Error('Committed change produced an empty patch');
     const patchPath = path.join(cfg.artifactsDir, `${id}.patch`);
     await writeFile(patchPath, patch, { mode: 0o600 });
     const digest = createHash('sha256').update(patch).digest('hex');
-    const prUrl = await createPullRequest(cfg, branch, task.title, `${task.prompt}\n\nAutomated checks passed in an isolated worker. Human review required; no auto-merge was requested.`);
-    return { branch, patchPath, sha256: digest, changedFiles: changes.split('\n'), prUrl };
+    const publication = await publishSuccessfulTask(cfg, { ...task }, {
+      branch, patchPath, sha256: digest, changedFiles: changes.split('\n'),
+    }, { pushBranch: branchToPush => pushBranch(cfg, repo, branchToPush) });
+    return { branch, patchPath, sha256: digest, changedFiles: changes.split('\n'), prUrl: publication?.prUrl ?? null, commentUrl: publication?.commentUrl ?? null };
   } finally {
     if (ownerShifted) await setWorktreeOwner(worktree, 0).catch(() => {});
+    if (sessionOwnerShifted) await setWorktreeOwner(sessionStateDir, 0, { privateFiles: true }).catch(() => {});
     await execFile('docker', ['rm', '-f', `dsh-worker-${id}`], { maxBuffer: 100_000 }).catch(() => {});
     if (proxyId) await execFile('docker', ['rm', '-f', proxyId], { maxBuffer: 100_000 }).catch(() => {});
     if (cfg.network !== 'none') await execFile('docker', ['network', 'rm', privateNetwork], { maxBuffer: 100_000 }).catch(() => {});

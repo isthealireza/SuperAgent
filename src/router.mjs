@@ -20,6 +20,28 @@ async function persist(cfg, task) {
   await writeFile(path.join(cfg.stateDir, `${task.id}.json`), `${JSON.stringify(task, null, 2)}\n`, { mode: 0o600 });
 }
 
+async function findTicket(cfg, issueNumber) {
+  if (!Number.isSafeInteger(issueNumber)) return null;
+  try { return JSON.parse(await readFile(path.join(cfg.stateDir, `ticket-${issueNumber}.json`), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+async function createTicket(cfg, issueNumber, taskId) {
+  const createdAt = Date.now();
+  const ticket = {
+    id: Number.isSafeInteger(issueNumber) ? `issue-${issueNumber}-${createdAt}` : taskId,
+    issueNumber: Number.isSafeInteger(issueNumber) ? issueNumber : null,
+    branch: Number.isSafeInteger(issueNumber) ? `agent/task-${issueNumber}-${createdAt}` : null,
+    sessionId: Number.isSafeInteger(issueNumber) ? `dsh-issue-${issueNumber}` : `dsh-${taskId}`,
+    createdAt: new Date(createdAt).toISOString(),
+    status: 'active',
+  };
+  if (Number.isSafeInteger(issueNumber)) {
+    await writeFile(path.join(cfg.stateDir, `ticket-${issueNumber}.json`), `${JSON.stringify(ticket, null, 2)}\n`, { mode: 0o600 });
+  }
+  return ticket;
+}
+
 function rateAllowed(cfg, sender) {
   const now = Date.now();
   const values = (rates.get(sender) ?? []).filter(time => now - time < 60_000);
@@ -41,11 +63,14 @@ export async function processIssue(input, { cfg = config(), testOnly = false, sk
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const task = { id, status: 'triaging', sender: input.sender, title: String(input.title).slice(0, 200), createdAt: new Date().toISOString() };
+  const task = { id, status: 'triaging', sender: input.sender, issueNumber: Number.isSafeInteger(input.issueNumber) ? input.issueNumber : null, title: String(input.title).slice(0, 200), createdAt: new Date().toISOString() };
   await persist(cfg, task);
   try {
+    const existingTicket = !testOnly && input.event === 'issue_comment' ? await findTicket(cfg, task.issueNumber) : null;
     const decision = testOnly
       ? { actionable: true, task: input.body }
+      : existingTicket
+        ? { actionable: true, task: `Continue the existing issue work using the same branch and Harness session. Treat this comment as follow-up context: ${input.body}` }
       : await triage(cfg, { title: input.title, body: input.body });
     if (!decision.actionable) {
       task.status = 'ignored';
@@ -55,10 +80,16 @@ export async function processIssue(input, { cfg = config(), testOnly = false, sk
     }
     task.status = 'running';
     task.prompt = decision.task;
+    const ticket = existingTicket ?? await createTicket(cfg, task.issueNumber, id);
+    task.ticketId = ticket.id;
     await persist(cfg, task);
     const result = await runWorker(cfg, {
       id,
       title: input.title,
+      issueNumber: task.issueNumber,
+      ticketId: ticket.id,
+      ticketBranch: ticket.branch,
+      sessionId: ticket.sessionId,
       prompt: `${decision.task}\n\nConstraints: reproduce the issue before editing; work only in /workspace; preserve existing interfaces; do not add credentials, push, merge, or edit files outside the requested fix. Run the configured validation command before finishing.`,
       testCommand: testOnly ? input.testCommand : cfg.testCommand,
       fixtureTarget: input.fixtureTarget,
@@ -67,6 +98,12 @@ export async function processIssue(input, { cfg = config(), testOnly = false, sk
     }, { projectRoot });
     task.status = 'ready_for_review';
     task.result = result;
+    ticket.lastTaskId = id;
+    ticket.updatedAt = new Date().toISOString();
+    ticket.lastResult = { branch: result.branch, prUrl: result.prUrl, changedFiles: result.changedFiles };
+    if (task.issueNumber !== null) {
+      await writeFile(path.join(cfg.stateDir, `ticket-${task.issueNumber}.json`), `${JSON.stringify(ticket, null, 2)}\n`, { mode: 0o600 });
+    }
     await persist(cfg, task);
     return { accepted: true, actionable: true, id, ...result };
   } catch (error) {
@@ -108,8 +145,9 @@ function readBody(req, limit = 1_000_000) {
   });
 }
 
-export async function startServer(cfg = config()) {
+export async function startServer(cfg = config(), { enqueueTask = enqueue } = {}) {
   if (!cfg.webhookSecret) throw new Error('WEBHOOK_SECRET must be configured before starting webhook ingress');
+  if (cfg.createPullRequest && !cfg.githubToken) throw new Error('GITHUB_TOKEN must be configured when CREATE_PULL_REQUEST=true');
   await mkdir(cfg.stateDir, { recursive: true });
   const { stdout: origin } = await execFile('git', ['-C', cfg.repoPath, 'remote', 'get-url', 'origin'], { maxBuffer: 100_000 });
   const remoteRepo = origin.trim().match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i)?.[1]?.toLowerCase();
@@ -142,6 +180,10 @@ export async function startServer(cfg = config()) {
       const issue = payload.issue ?? payload;
       const sender = payload.sender?.login ?? '';
       const action = payload.action ?? '';
+      if (event === 'issue_comment' && issue.pull_request) {
+        res.writeHead(202, { 'content-type': 'application/json' }).end('{"accepted":false,"reason":"pull_request_comments_not_supported"}\n');
+        return;
+      }
       const gateResult = gate({ sender, event, action, body: payload.comment?.body ?? issue.body ?? '', mention: cfg.triggerMention, allowlist: cfg.allowedSenders });
       if (!gateResult.ok) {
         res.writeHead(202, { 'content-type': 'application/json' }).end(`${JSON.stringify({ accepted: false, reason: gateResult.reason })}\n`);
@@ -152,13 +194,13 @@ export async function startServer(cfg = config()) {
         return;
       }
       const eventId = payload.comment?.id ?? issue.updated_at ?? randomUUID();
-      const input = { sender, event, action, body: payload.comment?.body ?? issue.body ?? '', title: issue.title ?? 'GitHub request', id: `gh-${issue.number ?? 'event'}-${eventId}` };
+      const input = { sender, event, action, body: payload.comment?.body ?? issue.body ?? '', title: issue.title ?? 'GitHub request', issueNumber: Number.isSafeInteger(issue.number) ? issue.number : null, id: `gh-${issue.number ?? 'event'}-${eventId}` };
       if (queue.length >= cfg.maxQueue) {
         res.writeHead(429).end('{"accepted":false,"reason":"queue_full"}\n');
         return;
       }
       res.writeHead(202, { 'content-type': 'application/json' }).end(`${JSON.stringify({ accepted: true, id: input.id })}\n`);
-      if (!enqueue(input, cfg)) console.error(`QUEUE_REJECTED id=${input.id}`);
+      if (!enqueueTask(input, cfg)) console.error(`QUEUE_REJECTED id=${input.id}`);
     } catch (error) {
       const status = error.message === 'payload_too_large' ? 413 : 400;
       res.writeHead(status, { 'content-type': 'application/json' }).end(`${JSON.stringify({ error: error.message })}\n`);

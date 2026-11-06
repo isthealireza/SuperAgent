@@ -1,6 +1,7 @@
 [Unit]
 Description=DeepSeek Super Agent GitHub Router
-After=default.target
+Requires=docker.service
+After=docker.service network-online.target
 
 [Service]
 Type=simple

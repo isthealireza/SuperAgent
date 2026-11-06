@@ -21,6 +21,7 @@ if (command === 'start') {
     sender: String(opts.sender ?? ''),
     event: String(opts.event ?? 'issues'),
     action: String(opts.action ?? 'opened'),
+    issueNumber: Number.isSafeInteger(Number(opts['issue-number'])) ? Number(opts['issue-number']) : null,
     id: String(opts.id ?? randomUUID()),
     title: String(opts.title ?? 'Manual request'),
     body: String(opts.body ?? ''),

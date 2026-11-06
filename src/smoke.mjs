@@ -132,7 +132,8 @@ async function verifyIngress() {
     githubOwner: 'isthealireza', githubRepo: 'SuperAgent',
     allowedSenders: new Set(['isthealireza']), triggerMention: '@superagent',
   };
-  const server = await startServer(cfg);
+  const acceptedInputs = [];
+  const server = await startServer(cfg, { enqueueTask: input => { acceptedInputs.push(input); return true; } });
   try {
     const address = server.address();
     const health = await fetch(`http://127.0.0.1:${address.port}/health`);
@@ -143,6 +144,12 @@ async function verifyIngress() {
       issue: { number: 55, title: 'Unauthorized synthetic issue', body: '@superagent make a change' },
     }));
     const signature = `sha256=${createHmac('sha256', secret).update(payload).digest('hex')}`;
+    const forged = await fetch(`http://127.0.0.1:${address.port}/github/webhook`, {
+      method: 'POST', body: payload,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': `sha256=${'0'.repeat(64)}`, 'x-github-event': 'issues' },
+    });
+    if (forged.status !== 401 || acceptedInputs.length !== 0) throw new Error('Forged webhook was not rejected before processing');
+    console.log('WEBHOOK_SIGNATURE_REJECTION_VERIFIED: forged_payload=401 processing=none');
     const response = await fetch(`http://127.0.0.1:${address.port}/github/webhook`, {
       method: 'POST', body: payload,
       headers: { 'content-type': 'application/json', 'x-hub-signature-256': signature, 'x-github-event': 'issues' },
@@ -152,7 +159,21 @@ async function verifyIngress() {
       throw new Error(`Router did not reject unauthorized sender before model triage: ${JSON.stringify(result)}`);
     }
     if ((await readdir(stateDir)).length !== 0) throw new Error('Unauthorized webhook wrote task state');
-    console.log('INGRESS_VERIFIED: webhook_hmac=true sender_allowlist=true llm_calls=0 unauthorized_state_writes=0');
+    const authorizedPayload = Buffer.from(JSON.stringify({
+      action: 'opened', repository: { full_name: 'isthealireza/SuperAgent' },
+      sender: { login: 'isthealireza' },
+      issue: { number: 56, title: 'Synthetic webhook check', body: '@superagent test this request' },
+    }));
+    const authorizedSignature = `sha256=${createHmac('sha256', secret).update(authorizedPayload).digest('hex')}`;
+    const authorizedResponse = await fetch(`http://127.0.0.1:${address.port}/github/webhook`, {
+      method: 'POST', body: authorizedPayload,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': authorizedSignature, 'x-github-event': 'issues' },
+    });
+    const authorized = await authorizedResponse.json();
+    if (authorizedResponse.status !== 202 || !authorized.accepted || acceptedInputs[0]?.issueNumber !== 56) {
+      throw new Error(`Signed authorized webhook did not reach the queue: ${JSON.stringify(authorized)}`);
+    }
+    console.log('INGRESS_VERIFIED: signed_payload=accepted sender_allowlist=true llm_calls=0 unauthorized_state_writes=0');
   } finally {
     await new Promise(resolve => server.close(resolve));
     await rm(stateDir, { recursive: true, force: true });

@@ -19,6 +19,10 @@ Rootless Docker worker (UID:GID 10001:10001)
 Human review (optional draft PR; never auto-merged)
 ```
 
+## Alignment with DeepSeek's prototype
+
+The local design follows the prototype's deterministic admission gate, per-ticket execution/session, Issue-thread follow-up, persisted state, successful-validation delivery, and Router/Executor separation. This deployment adds a rootless Docker boundary around the Executor and keeps GitHub credentials in the Router; the official prototype's deployment guide warns that its Sessions run with the operator's OS permissions and recommends a dedicated OS account for isolation. This implementation currently watches one repository through GitHub webhooks; it does not yet implement the prototype's polling/backfill, Feishu source, CI/review triggers, multi-ticket concurrency, durable retry queue, or full ticket panel.
+
 Runners: `claude` invokes Claude Code non-interactively; `dsh` uses the official DeepSeek Harness Python SDK with the explicit `sdk-minimal` profile and DeepSeek's Messages API; `fixture` is only for offline integration verification. Provider keys remain in the Router-side proxy; the coding worker receives only a placeholder key and never sees provider credentials. The proxy permits only Claude Messages, DeepSeek Messages, and DeepSeek Chat Completions routes. The triage key and optional GitHub token remain Router-only. The validation command is administrator configuration, never selected from issue text or model output.
 
 ## Prerequisites and install
@@ -34,17 +38,18 @@ npm run check
 npm test
 ```
 
-Install the persistent user service:
+Install the persistent user services and the Windows startup launcher:
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/.local/share/dsh-superagent
 cp deploy/dsh-superagent.service ~/.config/systemd/user/
+cp deploy/dsh-superagent-tunnel.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now dsh-superagent.service
+systemctl --user enable --now docker.service dsh-superagent.service
 systemctl --user status dsh-superagent.service
 ```
 
-The Router binds to `127.0.0.1` by default. To receive GitHub webhooks, expose that endpoint through a TLS-terminating reverse proxy or tunnel and set the same random secret in GitHub and `.env`. Do not expose the Router without HTTPS and webhook signature validation.
+The Router binds to `127.0.0.1` by default. For persistent public ingress, configure a Cloudflare Named Tunnel and add its token and stable HTTPS hostname to `.env`; the tunnel service registers or updates the GitHub webhook automatically. Cloudflare Quick Tunnels are temporary development URLs and are not used for production startup. The webhook accepts only signed `issues` and `issue_comment` events from the sender allowlist.
 
 ### Windows startup
 
@@ -55,7 +60,9 @@ $startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup
 Copy-Item '\\wsl.localhost\Ubuntu\home\alpha\src\SuperAgent\deploy\keep-wsl-alive.vbs' (Join-Path $startup 'DeepSeekSuperAgent.vbs')
 ```
 
-At the next Windows sign-in, it starts Ubuntu WSL hidden; the enabled Docker and Router user services start with it. Health is available from Windows at `http://localhost:3088/health`.
+At Windows sign-in, the hidden launcher starts the Docker and Router services and keeps WSL awake. Once Cloudflare and GitHub settings exist in `.env`, it also starts the tunnel and maintains the webhook. Health is available from Windows at `http://localhost:3088/health`.
+
+From PowerShell, control the whole stack with `scripts\\superagent.ps1 start`, `status`, `stop`, `restart`, or `logs`.
 
 ## Configuration
 
@@ -66,7 +73,7 @@ At the next Windows sign-in, it starts Ubuntu WSL hidden; the enabled Docker and
 | `ALLOWED_SENDERS` | Comma-separated GitHub login allowlist; default `isthealireza`. |
 | `TRIGGER_MENTION` | Required mention for issue and comment events; default `@superagent`. |
 | `REPO_PATH` | Existing clean local clone used for task worktrees. |
-| `WORKTREES_DIR`, `STATE_DIR`, `ARTIFACTS_DIR` | Router-owned task state and patch locations. |
+| `WORKTREES_DIR`, `STATE_DIR`, `ARTIFACTS_DIR`, `SESSION_STATE_DIR` | Router-owned worktrees, task/ticket state, patch artifacts and DSH session history. |
 | `MAX_QUEUE`, `MAX_PER_SENDER_PER_MINUTE` | Bounded serial queue and per-sender burst limit. |
 | `TRIAGE_BASE_URL`, `TRIAGE_MODEL`, `TRIAGE_API_KEY` | OpenAI-compatible triage endpoint; called only after all hard gates. `DEEPSEEK_API_KEY` is the fallback triage key. |
 | `WORKER_ENGINE` | `claude`, `dsh`, or test-only `fixture`. |
@@ -76,9 +83,12 @@ At the next Windows sign-in, it starts Ubuntu WSL hidden; the enabled Docker and
 | `WORKER_NETWORK` | `egress` routes model calls through the internal allowlisted proxy; `none` is offline-only. |
 | `WORKER_TEST_COMMAND` | Trusted project validation command; never derived from webhook content. |
 | `WORKER_CPUS`, `WORKER_MEMORY`, `WORKER_PIDS`, `WORKER_TIMEOUT_SECONDS`, `WORKER_MAX_TURNS` | Resource and execution limits. |
-| `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`, `CREATE_PULL_REQUEST` | Optional Router-only draft PR publishing. No merge is attempted. |
+| `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`, `CREATE_PULL_REQUEST` | Router-only branch push, non-draft PR creation, and one updatable status comment per issue. Auto-merge is disabled. |
+| `PUBLIC_WEBHOOK_URL` | Stable HTTPS hostname ending in `/github/webhook`, routed by the Cloudflare Named Tunnel to `http://127.0.0.1:3088`. |
+| `CLOUDFLARED_TUNNEL_TOKEN` | Tunnel token from the Cloudflare dashboard; stored only in the mode-600 `.env` file. |
 
 See `.env.example` for the complete template. The sample values are not credentials and must be replaced.
+For `GITHUB_TOKEN`, create a fine-grained token limited to `isthealireza/SuperAgent` with repository permissions **Contents: read/write**, **Issues: read/write**, **Pull requests: read/write**, **Webhooks: read/write**, and the automatic **Metadata: read** permission. The token is consumed only by the Router for branch push, PR/comment operations and webhook registration; it is never mounted into Worker containers.
 
 ## Use
 
@@ -86,11 +96,11 @@ See `.env.example` for the complete template. The sample values are not credenti
 # Build image (also built automatically if missing on first start)
 docker build -t dsh-superagent-worker:local .
 
-# Start/inspect/stop the persistent router
-systemctl --user start dsh-superagent.service
-systemctl --user status dsh-superagent.service
-journalctl --user -u dsh-superagent.service -f
-systemctl --user stop dsh-superagent.service
+# Start/inspect/stop from Windows PowerShell
+.\\scripts\\superagent.ps1 start
+.\\scripts\\superagent.ps1 status
+.\\scripts\\superagent.ps1 logs
+.\\scripts\\superagent.ps1 stop
 
 # Authorized manual trigger; issue must contain @superagent
 npm run trigger -- --sender isthealireza --event issues --action opened \
@@ -100,16 +110,16 @@ npm run trigger -- --sender isthealireza --event issues --action opened \
 npm run smoke
 ```
 
-Health check: `curl http://127.0.0.1:3088/health`. A successful run leaves a review patch in `ARTIFACTS_DIR` and a task JSON record in `STATE_DIR`. The task branch stays local unless draft PR publishing is explicitly enabled. Stop the router with `systemctl --user stop dsh-superagent.service`; stop Docker with `systemctl --user stop docker.service`.
+Health check: `curl http://127.0.0.1:3088/health`. A successful run leaves a review patch in `ARTIFACTS_DIR` and a task JSON record in `STATE_DIR`. If `CREATE_PULL_REQUEST=true` and a token is configured, the Router pushes the verified branch, opens a PR, and upserts a single issue status comment. The Worker never receives GitHub credentials and auto-merge remains disabled.
 
 ## Security and operating notes
 
 - Docker daemon is rootless in WSL; worker process is separately non-root (`10001:10001`).
 - Rootless UID mapping is handled by a resource-limited helper with only `CHOWN`, scoped to the one task worktree; it restores host ownership before the Router inspects or commits changes.
-- Worker root filesystem is read-only. It receives one writable bind mount: its task worktree. `/tmp` and the container's private home are bounded tmpfs mounts; `/tmp` is `noexec` for Claude and fixture workers. DSH enables execution only in its bounded `/tmp` because the official native-addon loader must materialize and load its N-API module there. The private home stays `noexec` for every runner.
+- Worker root filesystem is read-only. It receives its task worktree and, for DSH only, a dedicated per-issue session-state directory; neither contains credentials. `/tmp` and the container's private home are bounded tmpfs mounts; `/tmp` is `noexec` for Claude and fixture workers. DSH enables execution only in its bounded `/tmp` because the official native-addon loader must materialize and load its N-API module there. The private home stays `noexec` for every runner.
 - Remote model credentials stay in a Router-created proxy sidecar, not the coding worker. The worker joins an internal-only network; the proxy alone joins the outbound network and accepts only Claude Messages, DeepSeek Messages, or DeepSeek Chat Completions paths, injecting the selected provider key.
 - Default seccomp remains enabled; all Linux capabilities are dropped; `no-new-privileges`, CPU/RAM/PID limits, timeout, and bounded queue are enforced.
 - Offline smoke uses `--network none`. Remote model calls use the egress proxy. The proxy destination is operator-configured; for a local model endpoint, it must be reachable from the WSL Docker network and must be treated as a trusted endpoint.
-- GitHub credentials stay in the Router process; workers cannot push. Draft PR creation is Router-side and human review remains mandatory. Auto-merge is not implemented.
+- GitHub credentials stay in the Router process; workers cannot push. The Router creates non-draft PRs only after reproduction and validation succeed, and updates one marked status comment per issue. Issue comments continue the same branch and persistent DSH session. Human review remains mandatory; auto-merge is not implemented.
 - Docker's WSL rootless daemon reports that cgroup I/O weighting/throughput limits are unavailable on this host. CPU, memory, and PID controls are verified separately.
 - On router restart, in-flight task records are marked `interrupted`; only containers carrying this product's Docker label are stopped and removed. Other Docker data is left alone.
