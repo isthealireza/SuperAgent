@@ -71,47 +71,44 @@ async function acquireLock(lockPath) {
   throw new Error('Timed out waiting for another task using this repository to finish.');
 }
 
-async function prepareRepository() {
-  const repo = parseRepo(repository);
+async function prepareRepository(repo) {
   const authEnv = gitAuthEnv();
   const root = path.resolve(cfg.repositoriesDir);
   const repoPath = path.resolve(root, repo.name);
   if (!repoPath.startsWith(`${root}${path.sep}`)) throw new Error('Repository path escaped the configured repository store.');
   await mkdir(root, { recursive: true, mode: 0o700 });
-  const unlock = await acquireLock(path.join(root, '.locks', `${repo.name.toLowerCase()}.lock`));
-  try {
-    const origin = `https://github.com/${repo.owner}/${repo.name}.git`;
-    let exists = false;
-    try { exists = (await stat(path.join(repoPath, '.git'))).isDirectory(); }
+  const origin = `https://github.com/${repo.owner}/${repo.name}.git`;
+  let exists = false;
+  try { exists = (await stat(path.join(repoPath, '.git'))).isDirectory(); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (!exists) {
+    try { await stat(repoPath); throw new Error('A non-Git path already occupies this repository name. Refusing to overwrite it.'); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (!exists) {
-      try { await stat(repoPath); throw new Error('A non-Git path already occupies this repository name. Refusing to overwrite it.'); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
-      await saveJob('cloning_repository', { repository: `${repo.owner}/${repo.name}` });
-      await execFile('git', ['clone', '--', origin, repoPath], { env: authEnv, maxBuffer: 2 * 1024 * 1024, timeout: 900_000 });
-    }
-    const currentOrigin = (await git(repoPath, ['remote', 'get-url', 'origin'])).replace(/\.git$/i, '').toLowerCase();
-    if (currentOrigin !== origin.replace(/\.git$/i, '').toLowerCase()) throw new Error('The saved clone origin does not match the requested GitHub repository.');
-    if (await git(repoPath, ['status', '--porcelain'])) throw new Error('The Super Agent repository clone has local changes; refusing to overwrite them.');
-    await git(repoPath, ['fetch', '--prune', 'origin'], authEnv);
-    let defaultRef = await git(repoPath, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']).catch(() => '');
-    if (!defaultRef) {
-      await git(repoPath, ['remote', 'set-head', 'origin', '--auto'], authEnv);
-      defaultRef = await git(repoPath, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
-    }
-    if (!defaultRef.startsWith('refs/remotes/origin/')) throw new Error('GitHub did not provide a default branch for this repository.');
-    const baseRef = defaultRef.replace(/^refs\/remotes\//, '');
-    await git(repoPath, ['switch', '--detach', baseRef]);
-    await git(repoPath, ['reset', '--hard', baseRef]);
-    return { repoPath, owner: repo.owner, name: repo.name };
-  } finally {
-    await unlock();
+    await saveJob('cloning_repository', { repository: `${repo.owner}/${repo.name}` });
+    await execFile('git', ['clone', '--', origin, repoPath], { env: authEnv, maxBuffer: 2 * 1024 * 1024, timeout: 900_000 });
   }
+  const currentOrigin = (await git(repoPath, ['remote', 'get-url', 'origin'])).replace(/\.git$/i, '').toLowerCase();
+  if (currentOrigin !== origin.replace(/\.git$/i, '').toLowerCase()) throw new Error('The saved clone origin does not match the requested GitHub repository.');
+  if (await git(repoPath, ['status', '--porcelain'])) throw new Error('The Super Agent repository clone has local changes; refusing to overwrite them.');
+  await git(repoPath, ['fetch', '--prune', 'origin'], authEnv);
+  let defaultRef = await git(repoPath, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']).catch(() => '');
+  if (!defaultRef) {
+    await git(repoPath, ['remote', 'set-head', 'origin', '--auto'], authEnv);
+    defaultRef = await git(repoPath, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
+  }
+  if (!defaultRef.startsWith('refs/remotes/origin/')) throw new Error('GitHub did not provide a default branch for this repository.');
+  const baseRef = defaultRef.replace(/^refs\/remotes\//, '');
+  await git(repoPath, ['switch', '--detach', baseRef]);
+  await git(repoPath, ['reset', '--hard', baseRef]);
+  return { repoPath, owner: repo.owner, name: repo.name };
 }
 
+let unlock;
 try {
+  const requestedRepo = parseRepo(repository);
+  unlock = await acquireLock(path.join(cfg.repositoriesDir, '.locks', `${requestedRepo.name.toLowerCase()}.lock`));
   await saveJob('preparing_repository');
-  const repo = await prepareRepository();
+  const repo = await prepareRepository(requestedRepo);
   await saveJob('running_worker', { repository: `${repo.owner}/${repo.name}` });
   const taskCfg = { ...cfg, repoPath: repo.repoPath, githubOwner: repo.owner, githubRepo: repo.name };
   const result = await processIssue({
@@ -129,4 +126,6 @@ try {
   await saveJob('failed', { error: String(error.message).slice(0, 2500), completedAt: new Date().toISOString() }).catch(() => {});
   console.error(`MCP_TASK_FAILED id=${id} error=${error.message}`);
   process.exitCode = 1;
+} finally {
+  await unlock?.();
 }
