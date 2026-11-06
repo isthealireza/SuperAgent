@@ -179,7 +179,7 @@ async function setWorktreeOwner(worktree, uid, { privateFiles = false } = {}) {
   const args = [
     'run', '--rm', '--network', 'none', '--read-only', '--user', '0:0', '--memory', '256m', '--cpus', '0.25', '--pids-limit', '32',
     '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges=true',
-    ...(privateFiles ? ['--cap-add', 'DAC_OVERRIDE'] : []),
+    ...(privateFiles || uid === 0 ? ['--cap-add', 'DAC_OVERRIDE'] : []),
     '--mount', `type=bind,src=${worktree},dst=/workspace`,
     '--entrypoint', 'chown', imageName, '-R', `${uid}:${uid}`, '/workspace',
   ];
