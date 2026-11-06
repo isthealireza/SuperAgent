@@ -37,7 +37,7 @@ npm test
 Install the persistent user service:
 
 ```bash
-mkdir -p ~/.config/systemd/user
+mkdir -p ~/.config/systemd/user ~/.local/share/dsh-superagent
 cp deploy/dsh-superagent.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now dsh-superagent.service
