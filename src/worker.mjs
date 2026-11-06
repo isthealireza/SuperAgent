@@ -137,12 +137,17 @@ export async function startModelProxy(cfg, task) {
 }
 
 function containerArgs(cfg, task, worktree, privateNetwork) {
+  // The official DSH native addon loader materializes its N-API module in /tmp
+  // before dlopen, so only DSH needs an executable bounded temp mount.
+  const tempMountOptions = cfg.engine === 'dsh'
+    ? 'rw,exec,nosuid,nodev,size=256m,uid=10001,gid=10001'
+    : 'rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001';
   const args = [
     'run', '--name', `dsh-worker-${task.id}`,
     '--label', 'io.dsh.superagent=worker', '--label', `io.dsh.task=${task.id}`,
     '--read-only', '--user', '10001:10001',
     '--workdir', '/workspace', '--mount', `type=bind,src=${worktree},dst=/workspace`,
-    '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001',
+    '--tmpfs', `/tmp:${tempMountOptions}`,
     '--tmpfs', '/home/agent:rw,noexec,nosuid,nodev,size=512m,uid=10001,gid=10001',
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true',
     '--memory', cfg.memory, '--cpus', String(cfg.cpus), '--pids-limit', String(cfg.pids),
@@ -153,7 +158,7 @@ function containerArgs(cfg, task, worktree, privateNetwork) {
     '--env', `WORKER_TEST_COMMAND=${task.testCommand || cfg.testCommand}`,
     '--env', `WORKER_MAX_TURNS=${cfg.maxTurns}`,
     '--env', `DSH_MODEL=${cfg.dshModel}`,
-    '--env', 'DEEPSEEK_BASE_URL=http://dsh-model-proxy:8080/deepseek',
+    '--env', 'DEEPSEEK_BASE_URL=http://dsh-model-proxy:8080/deepseek/anthropic',
     '--env', 'ANTHROPIC_BASE_URL=http://dsh-model-proxy:8080/anthropic',
     '--env', `FIXTURE_TARGET=${task.fixtureTarget ?? ''}`,
     '--env', `FIXTURE_REPLACEMENT=${task.fixtureReplacement ?? ''}`,

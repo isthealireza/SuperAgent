@@ -49,7 +49,7 @@ const server = createServer(async (req, res) => {
     api = 'anthropic';
   } else if (req.method === 'POST' && path.startsWith('/deepseek/')) {
     const suffix = path.slice('/deepseek'.length);
-    if (!['/chat/completions', '/v1/chat/completions'].includes(suffix)) {
+    if (!['/chat/completions', '/v1/chat/completions', '/anthropic/v1/messages'].includes(suffix)) {
       res.writeHead(403).end('endpoint_not_allowed');
       return;
     }

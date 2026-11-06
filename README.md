@@ -19,7 +19,7 @@ Rootless Docker worker (UID:GID 10001:10001)
 Human review (optional draft PR; never auto-merged)
 ```
 
-Runners: `claude` invokes Claude Code non-interactively; `dsh` uses the official DeepSeek Harness Python SDK with the explicit `sdk-minimal` profile; `fixture` is only for offline integration verification. Provider keys remain in the Router-side proxy; the coding worker receives only a placeholder key and never sees provider credentials. The triage key and optional GitHub token remain Router-only. The validation command is administrator configuration, never selected from issue text or model output.
+Runners: `claude` invokes Claude Code non-interactively; `dsh` uses the official DeepSeek Harness Python SDK with the explicit `sdk-minimal` profile and DeepSeek's Messages API; `fixture` is only for offline integration verification. Provider keys remain in the Router-side proxy; the coding worker receives only a placeholder key and never sees provider credentials. The proxy permits only Claude Messages, DeepSeek Messages, and DeepSeek Chat Completions routes. The triage key and optional GitHub token remain Router-only. The validation command is administrator configuration, never selected from issue text or model output.
 
 ## Prerequisites and install
 
@@ -106,8 +106,8 @@ Health check: `curl http://127.0.0.1:3088/health`. A successful run leaves a rev
 
 - Docker daemon is rootless in WSL; worker process is separately non-root (`10001:10001`).
 - Rootless UID mapping is handled by a resource-limited helper with only `CHOWN`, scoped to the one task worktree; it restores host ownership before the Router inspects or commits changes.
-- Worker root filesystem is read-only. It receives one writable bind mount: its task worktree. `/tmp` and the container's private home are bounded tmpfs mounts.
-- Remote model credentials stay in a Router-created proxy sidecar, not the coding worker. The worker joins an internal-only network; the proxy alone joins the outbound network and accepts only Claude Messages or DeepSeek Chat Completions paths, injecting the selected provider key.
+- Worker root filesystem is read-only. It receives one writable bind mount: its task worktree. `/tmp` and the container's private home are bounded tmpfs mounts; `/tmp` is `noexec` for Claude and fixture workers. DSH enables execution only in its bounded `/tmp` because the official native-addon loader must materialize and load its N-API module there. The private home stays `noexec` for every runner.
+- Remote model credentials stay in a Router-created proxy sidecar, not the coding worker. The worker joins an internal-only network; the proxy alone joins the outbound network and accepts only Claude Messages, DeepSeek Messages, or DeepSeek Chat Completions paths, injecting the selected provider key.
 - Default seccomp remains enabled; all Linux capabilities are dropped; `no-new-privileges`, CPU/RAM/PID limits, timeout, and bounded queue are enforced.
 - Offline smoke uses `--network none`. Remote model calls use the egress proxy. The proxy destination is operator-configured; for a local model endpoint, it must be reachable from the WSL Docker network and must be treated as a trusted endpoint.
 - GitHub credentials stay in the Router process; workers cannot push. Draft PR creation is Router-side and human review remains mandatory. Auto-merge is not implemented.

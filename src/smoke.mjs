@@ -55,11 +55,12 @@ async function verifyEgressProxy() {
   const privateNetwork = `dsh-task-${id}-internal`;
   const mockName = `dsh-mock-${id}`;
   let proxyId = null;
+  let dshProxyId = null;
   try {
     await ensureImage(path.resolve(import.meta.dirname, '..'));
     try { await execFile('docker', ['network', 'inspect', 'dsh-worker-egress']); }
     catch { await execFile('docker', ['network', 'create', '--label', 'io.dsh.superagent=egress-network', 'dsh-worker-egress']); }
-    const mockCode = "const http=require('node:http');http.createServer((req,res)=>{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({key:req.headers['x-api-key'],path:req.url}))}).listen(9000,'0.0.0.0')";
+    const mockCode = "const http=require('node:http');http.createServer((req,res)=>{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({key:req.headers['x-api-key'],authorization:req.headers.authorization,path:req.url}))}).listen(9000,'0.0.0.0')";
     await execFile('docker', ['run', '-d', '--name', mockName, '--network', 'dsh-worker-egress', '--network-alias', mockName,
       '--read-only', '--user', '10001:10001', '--memory', '128m', '--cpus', '0.25', '--pids-limit', '32',
       '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true', '--entrypoint', 'node', 'dsh-superagent-proxy:local', '-e', mockCode]);
@@ -91,10 +92,34 @@ async function verifyEgressProxy() {
       '--memory', '256m', '--cpus', '0.5', '--pids-limit', '64', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true',
       '--entrypoint', 'python3', 'dsh-superagent-worker:local', '-c', code], { maxBuffer: 100_000, timeout: 30_000 });
     process.stdout.write(stdout);
+    await execFile('docker', ['rm', '-f', proxyId]);
+    proxyId = null;
+
+    const dshId = `${id}-dsh`;
+    const dshNetwork = `dsh-task-${dshId}-internal`;
+    const dshCfg = {
+      ...config(), engine: 'dsh', network: 'egress', anthropicApiKey: '', deepseekApiKey: 'smoke-only-deepseek-secret',
+      deepseekUpstreamUrl: `http://${mockName}:9000`,
+    };
+    dshProxyId = await startModelProxy(dshCfg, { id: dshId });
+    const dshCode = [
+      'import json, urllib.request',
+      'request=urllib.request.Request("http://dsh-model-proxy:8080/deepseek/anthropic/v1/messages", data=b"{}", headers={"content-type":"application/json","authorization":"Bearer worker-placeholder"})',
+      'response=json.load(urllib.request.urlopen(request, timeout=5))',
+      'assert response["authorization"] == "Bearer smoke-only-deepseek-secret", response',
+      'assert response["path"] == "/anthropic/v1/messages", response',
+      'print("DSH_MESSAGES_PROXY_VERIFIED: key_injected=true route_allowlist=true upstream=/anthropic/v1/messages")',
+    ].join('\n');
+    const { stdout: dshStdout } = await execFile('docker', ['run', '--rm', '--network', dshNetwork, '--read-only', '--user', '10001:10001',
+      '--memory', '256m', '--cpus', '0.5', '--pids-limit', '64', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true',
+      '--entrypoint', 'python3', 'dsh-superagent-worker:local', '-c', dshCode], { maxBuffer: 100_000, timeout: 30_000 });
+    process.stdout.write(dshStdout);
   } finally {
     if (proxyId) await execFile('docker', ['rm', '-f', proxyId]).catch(() => {});
+    if (dshProxyId) await execFile('docker', ['rm', '-f', dshProxyId]).catch(() => {});
     await execFile('docker', ['rm', '-f', mockName]).catch(() => {});
     await execFile('docker', ['network', 'rm', privateNetwork]).catch(() => {});
+    await execFile('docker', ['network', 'rm', `dsh-task-${id}-dsh-internal`]).catch(() => {});
   }
 }
 
