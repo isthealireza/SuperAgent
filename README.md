@@ -102,6 +102,12 @@ docker build -t dsh-superagent-worker:local .
 .\\scripts\\superagent.ps1 logs
 .\\scripts\\superagent.ps1 stop
 
+# Start/inspect/stop the Linux/WSL user service with npm
+npm run service:start
+npm run service:status
+npm run service:logs
+npm run service:stop
+
 # Authorized manual trigger; issue must contain @superagent
 npm run trigger -- --sender isthealireza --event issues --action opened \
   --title "Fix a regression" --body "@superagent Reproduce and fix the failing test."
