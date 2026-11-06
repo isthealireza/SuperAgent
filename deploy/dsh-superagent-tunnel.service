@@ -1,0 +1,22 @@
+[Unit]
+Description=DeepSeek Super Agent named Cloudflare Tunnel and GitHub webhook registration
+Requires=dsh-superagent.service
+After=dsh-superagent.service network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alpha/src/SuperAgent
+ExecStartPre=/usr/local/bin/node --env-file-if-exists=.env src/prepare-tunnel.mjs
+ExecStart=/home/alpha/.local/bin/cloudflared tunnel --no-autoupdate run --token-file /home/alpha/.local/share/dsh-superagent/state/cloudflare-tunnel-token
+ExecStartPost=/usr/local/bin/node --env-file-if-exists=.env src/register-webhook.mjs
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/alpha/.local/share/dsh-superagent
+
+[Install]
+WantedBy=default.target
