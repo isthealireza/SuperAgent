@@ -1,0 +1,20 @@
+[Unit]
+Description=DeepSeek Super Agent GitHub Router
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alpha/src/SuperAgent
+Environment=DOCKER_HOST=unix:///run/user/1000/docker.sock
+ExecStart=/home/alpha/.nvm/versions/node/v24.22.2/bin/node --env-file-if-exists=.env src/cli.mjs start
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/alpha/src/SuperAgent /home/alpha/.local/share/dsh-superagent /home/alpha/.cache/dsh-superagent
+
+[Install]
+WantedBy=default.target

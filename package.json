@@ -1,0 +1,15 @@
+{
+  "name": "deepseek-superagent-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Rootless Docker isolated GitHub issue agent router",
+  "engines": { "node": ">=22.12" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/cli.mjs start",
+    "trigger": "node --env-file-if-exists=.env src/cli.mjs trigger",
+    "smoke": "node src/smoke.mjs",
+    "check": "node --check src/cli.mjs && node --check src/router.mjs && node --check src/worker.mjs && node --check src/triage.mjs && node --check src/security.mjs && node --check src/smoke.mjs && node --check worker/runner.mjs && node --check worker/egress-proxy.mjs",
+    "test": "node --test"
+  }
+}
