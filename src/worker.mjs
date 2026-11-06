@@ -269,7 +269,7 @@ export async function runWorker(cfg, task, { projectRoot }) {
     const changes = await git(worktree, ['diff', '--cached', '--name-only']);
     if (!changes) throw new Error('Worker completed without producing a tracked patch');
     const commitDetails = slug(task.title).replaceAll('-', ' ');
-    const commitTitle = `fix(agent): ${commitDetails.slice(0, 72 - 'fix(agent):  [skip ci]'.length)} [skip ci]`;
+    const commitTitle = `fix(agent): ${commitDetails.slice(0, 72 - 'fix(agent): '.length)}`;
     await git(worktree, ['-c', 'user.name=DeepSeek Super Agent', '-c', 'user.email=superagent@users.noreply.github.com', 'commit', '-m', commitTitle]);
     const patch = await git(worktree, ['show', '--format=', '--binary', 'HEAD']);
     if (!patch) throw new Error('Committed change produced an empty patch');
@@ -279,7 +279,7 @@ export async function runWorker(cfg, task, { projectRoot }) {
     const publication = await publishSuccessfulTask(cfg, { ...task }, {
       branch, patchPath, sha256: digest, changedFiles: changes.split('\n'),
     }, { pushBranch: branchToPush => pushBranch(cfg, repo, branchToPush) });
-    return { branch, patchPath, sha256: digest, changedFiles: changes.split('\n'), prUrl: publication?.prUrl ?? null, commentUrl: publication?.commentUrl ?? null };
+    return { branch, patchPath, sha256: digest, changedFiles: changes.split('\n'), prUrl: publication?.prUrl ?? null, commentUrl: publication?.commentUrl ?? null, autoMerge: publication?.autoMerge ?? null };
   } finally {
     if (ownerShifted) await setWorktreeOwner(worktree, 0).catch(() => {});
     if (sessionOwnerShifted) await setWorktreeOwner(sessionStateDir, 0, { privateFiles: true }).catch(() => {});

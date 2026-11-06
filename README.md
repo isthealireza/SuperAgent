@@ -1,6 +1,6 @@
 # DeepSeek Super Agent Router
 
-Single-repository GitHub issue router with disposable, rootless-Docker workers. The Router performs signature and sender checks before any model request. Each accepted task gets a new local branch/worktree, is mounted alone into a non-root worker, runs a reproduction and configured validation command, and is returned as a local patch. An optional Router-only GitHub token can publish a draft PR. The worker has no Git metadata, GitHub token, Docker socket, SSH keys, host home, parent repository mount, or merge capability.
+GitHub and DeepSeek Harness integration with disposable, rootless-Docker workers. The Router performs signature and sender checks before any model request. Each accepted task gets a new local branch/worktree, is mounted alone into a non-root worker, runs a reproduction and configured validation command, and is returned as a local patch. The Router can publish a PR and request GitHub auto-merge after validation. The worker has no Git metadata, GitHub token, Docker socket, SSH keys, host home, parent repository mount, or merge capability.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ Rootless Docker worker (UID:GID 10001:10001)
   network none (offline fixture) or internal network with a narrow egress proxy
         │ test log + host-validated commit + patch artifact
         ▼
-Human review (optional draft PR; never auto-merged)
+Pull Request (auto-merge requested after successful validation, when enabled)
 ```
 
 ## Alignment with DeepSeek's prototype
@@ -83,7 +83,7 @@ From PowerShell, control the whole stack with `scripts\\superagent.ps1 start`, `
 | `WORKER_NETWORK` | `egress` routes model calls through the internal allowlisted proxy; `none` is offline-only. |
 | `WORKER_TEST_COMMAND` | Trusted project validation command; never derived from webhook content. |
 | `WORKER_CPUS`, `WORKER_MEMORY`, `WORKER_PIDS`, `WORKER_TIMEOUT_SECONDS`, `WORKER_MAX_TURNS` | Resource and execution limits. |
-| `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`, `CREATE_PULL_REQUEST` | Router-only branch push, non-draft PR creation, and one updatable status comment per issue. Auto-merge is disabled. |
+| `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`, `CREATE_PULL_REQUEST`, `AUTO_MERGE` | Router-only branch push, non-draft PR creation, and one updatable status comment per issue. With `AUTO_MERGE=true`, the Router requests squash auto-merge only after worker validation; GitHub repository rules still govern when it merges. |
 | `PUBLIC_WEBHOOK_URL` | Stable HTTPS hostname ending in `/github/webhook`, routed by the Cloudflare Named Tunnel to `http://127.0.0.1:3088`. |
 | `CLOUDFLARED_TUNNEL_TOKEN` | Tunnel token from the Cloudflare dashboard; stored only in the mode-600 `.env` file. |
 
@@ -102,12 +102,6 @@ docker build -t dsh-superagent-worker:local .
 .\\scripts\\superagent.ps1 logs
 .\\scripts\\superagent.ps1 stop
 
-# Start/inspect/stop the Linux/WSL user service with npm
-npm run service:start
-npm run service:status
-npm run service:logs
-npm run service:stop
-
 # Authorized manual trigger; issue must contain @superagent
 npm run trigger -- --sender isthealireza --event issues --action opened \
   --title "Fix a regression" --body "@superagent Reproduce and fix the failing test."
@@ -116,7 +110,13 @@ npm run trigger -- --sender isthealireza --event issues --action opened \
 npm run smoke
 ```
 
-Health check: `curl http://127.0.0.1:3088/health`. A successful run leaves a review patch in `ARTIFACTS_DIR` and a task JSON record in `STATE_DIR`. If `CREATE_PULL_REQUEST=true` and a token is configured, the Router pushes the verified branch, opens a PR, and upserts a single issue status comment. The Worker never receives GitHub credentials and auto-merge remains disabled.
+Health check: `curl http://127.0.0.1:3088/health`. A successful run leaves a patch in `ARTIFACTS_DIR` and a task JSON record in `STATE_DIR`. If `CREATE_PULL_REQUEST=true` and a token is configured, the Router pushes the verified branch, opens a PR, and requests auto-merge when `AUTO_MERGE=true`. The Worker never receives GitHub credentials.
+
+## Invoke from DeepSeek Harness
+
+The desktop profile connects to the local Router through the `superagent` stdio MCP server. In a Harness chat, ask it to call `mcp__superagent__start_task` with a GitHub repository you own, a short title, and the task details. Only repositories under `GITHUB_OWNER` are accepted. The task runs in a detached process and continues if the Harness window closes. Save the returned `taskId`, then call `mcp__superagent__get_task_status` to retrieve progress and the PR link. Call `mcp__superagent__status` to check the connection without starting work.
+
+The initial validation command is the Router's configured `WORKER_TEST_COMMAND` (default `npm test`), so set it to the target repository's trusted test command before sending tasks. This first integration handles one task per clone at a time and supports repositories with a compatible Docker build and test setup; it does not infer safe dependency installation or validation commands from user task text.
 
 ## Security and operating notes
 
@@ -126,6 +126,6 @@ Health check: `curl http://127.0.0.1:3088/health`. A successful run leaves a rev
 - Remote model credentials stay in a Router-created proxy sidecar, not the coding worker. The worker joins an internal-only network; the proxy alone joins the outbound network and accepts only Claude Messages, DeepSeek Messages, or DeepSeek Chat Completions paths, injecting the selected provider key.
 - Default seccomp remains enabled; all Linux capabilities are dropped; `no-new-privileges`, CPU/RAM/PID limits, timeout, and bounded queue are enforced.
 - Offline smoke uses `--network none`. Remote model calls use the egress proxy. The proxy destination is operator-configured; for a local model endpoint, it must be reachable from the WSL Docker network and must be treated as a trusted endpoint.
-- GitHub credentials stay in the Router process; workers cannot push. The Router creates non-draft PRs only after reproduction and validation succeed, and updates one marked status comment per issue. Issue comments continue the same branch and persistent DSH session. Human review remains mandatory; auto-merge is not implemented.
+- GitHub credentials stay in the Router process; workers cannot push. The Router creates non-draft PRs only after reproduction and validation succeed. Auto-merge requests wait on GitHub's configured branch rules and required checks. Issue comments continue the same branch and persistent DSH session.
 - Docker's WSL rootless daemon reports that cgroup I/O weighting/throughput limits are unavailable on this host. CPU, memory, and PID controls are verified separately.
 - On router restart, in-flight task records are marked `interrupted`; only containers carrying this product's Docker label are stopped and removed. Other Docker data is left alone.

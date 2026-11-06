@@ -31,6 +31,7 @@ export function config() {
     stateDir: path.resolve(process.env.STATE_DIR ?? path.join(base, 'state')),
     artifactsDir: path.resolve(process.env.ARTIFACTS_DIR ?? path.join(base, 'artifacts')),
     sessionStateDir: path.resolve(process.env.SESSION_STATE_DIR ?? path.join(base, 'sessions')),
+    repositoriesDir: path.resolve(process.env.REPOSITORIES_DIR ?? path.join(base, 'repositories')),
     maxQueue: integer('MAX_QUEUE', 20),
     ratePerMinute: integer('MAX_PER_SENDER_PER_MINUTE', 3),
     triageBaseUrl: (process.env.TRIAGE_BASE_URL ?? 'https://api.deepseek.com').replace(/\/$/, ''),
@@ -53,6 +54,7 @@ export function config() {
     githubOwner: process.env.GITHUB_OWNER ?? 'isthealireza',
     githubRepo: process.env.GITHUB_REPO ?? 'SuperAgent',
     createPullRequest: process.env.CREATE_PULL_REQUEST === 'true',
+    autoMerge: process.env.AUTO_MERGE === 'true',
     publicWebhookUrl: process.env.PUBLIC_WEBHOOK_URL ?? '',
   };
 }

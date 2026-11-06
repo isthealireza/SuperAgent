@@ -4,17 +4,24 @@
   "private": true,
   "type": "module",
   "description": "Rootless Docker isolated GitHub issue agent router",
-  "engines": { "node": ">=22.12" },
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env src/cli.mjs start",
     "trigger": "node --env-file-if-exists=.env src/cli.mjs trigger",
     "smoke": "node src/smoke.mjs",
+    "mcp:smoke": "node --env-file-if-exists=.env scripts/mcp-smoke.mjs",
     "service:start": "bash scripts/superagent.sh start",
     "service:status": "bash scripts/superagent.sh status",
     "service:stop": "bash scripts/superagent.sh stop",
     "service:restart": "bash scripts/superagent.sh restart",
     "service:logs": "bash scripts/superagent.sh logs",
-    "check": "node --check src/cli.mjs && node --check src/router.mjs && node --check src/github.mjs && node --check src/register-webhook.mjs && node --check src/prepare-tunnel.mjs && node --check src/worker.mjs && node --check src/triage.mjs && node --check src/security.mjs && node --check src/smoke.mjs && node --check worker/runner.mjs && node --check worker/egress-proxy.mjs",
+    "check": "node --check src/cli.mjs && node --check src/router.mjs && node --check src/github.mjs && node --check src/register-webhook.mjs && node --check src/prepare-tunnel.mjs && node --check src/worker.mjs && node --check src/triage.mjs && node --check src/security.mjs && node --check src/smoke.mjs && node --check src/mcp-server.mjs && node --check src/mcp-task.mjs && node --check scripts/mcp-smoke.mjs && node --check worker/runner.mjs && node --check worker/egress-proxy.mjs",
     "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
   }
 }

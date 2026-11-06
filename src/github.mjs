@@ -29,6 +29,31 @@ async function findStatusComment(fetchImpl, token, owner, repo, issueNumber) {
   throw new Error(`GitHub issue #${issueNumber} has too many comments to safely find the existing Super Agent status`);
 }
 
+async function enableAutoMerge(fetchImpl, token, pullRequestId) {
+  if (!pullRequestId) throw new Error('GitHub did not return a pull request node id for auto-merge');
+  const response = await fetchImpl(`${apiRoot}/graphql`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: 'application/vnd.github+json',
+      'content-type': 'application/json',
+      'x-github-api-version': '2022-11-28',
+    },
+    body: JSON.stringify({
+      query: 'mutation EnableAgentAutoMerge($pullRequestId: ID!) { enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: SQUASH }) { pullRequest { autoMergeRequest { enabledAt mergeMethod } } } }',
+      variables: { pullRequestId },
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.errors?.length) {
+    throw new Error(`GitHub auto-merge request failed: ${result.errors?.[0]?.message ?? `HTTP ${response.status}`}`);
+  }
+  const request = result.data?.enablePullRequestAutoMerge?.pullRequest?.autoMergeRequest;
+  if (!request?.enabledAt) throw new Error('GitHub did not confirm that auto-merge was enabled');
+  return { enabled: true, enabledAt: request.enabledAt, mergeMethod: request.mergeMethod };
+}
+
 /** Push a verified branch, open/reuse its PR, and upsert one status comment. */
 export async function publishSuccessfulTask(cfg, task, result, { fetchImpl = fetch, pushBranch } = {}) {
   if (!cfg.createPullRequest) return null;
@@ -55,11 +80,13 @@ export async function publishSuccessfulTask(cfg, task, result, { fetchImpl = fet
         title: `Fix: ${task.title}`.slice(0, 240),
         head: result.branch,
         base: repository.default_branch,
-        body: `${task.prompt}\n\nValidation passed in the isolated Worker. Human review is required; auto-merge is disabled.${issueLink}`,
+        body: `${task.prompt}\n\nValidation passed in the isolated Worker. ${cfg.autoMerge ? 'GitHub auto-merge was requested and will proceed only when repository rules allow it.' : 'Human review is required; auto-merge is disabled.'}${issueLink}`,
         draft: false,
       },
     });
   }
+
+  const autoMerge = cfg.autoMerge ? await enableAutoMerge(fetchImpl, token, pr.node_id) : { enabled: false };
 
   let commentUrl = null;
   if (Number.isSafeInteger(task.issueNumber)) {
@@ -72,6 +99,9 @@ export async function publishSuccessfulTask(cfg, task, result, { fetchImpl = fet
       `- Branch: \`${result.branch}\``,
       '- Reproduction: confirmed before the fix',
       '- Validation: passed in the isolated Worker',
+      cfg.autoMerge
+        ? '- Auto-merge: requested after worker validation; GitHub will merge when repository rules allow it'
+        : '- Auto-merge: disabled; human review is required',
       '',
       'Changed files:',
       files,
@@ -84,7 +114,7 @@ export async function publishSuccessfulTask(cfg, task, result, { fetchImpl = fet
       : await request(fetchImpl, token, `${root}/issues/${task.issueNumber}/comments`, { method: 'POST', body: { body: comment } });
     commentUrl = saved.html_url ?? null;
   }
-  return { prUrl: pr.html_url, commentUrl };
+  return { prUrl: pr.html_url, commentUrl, autoMerge };
 }
 
 export async function registerGitHubWebhook(cfg, { fetchImpl = fetch, stateFile } = {}) {

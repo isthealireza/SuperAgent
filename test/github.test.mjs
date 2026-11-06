@@ -48,6 +48,25 @@ test('successful local tasks do not contact GitHub when PR publishing is disable
   assert.equal(pushed, false);
 });
 
+test('requests squash auto-merge only when enabled and reports the GitHub confirmation', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method ?? 'GET', body: init.body ? JSON.parse(init.body) : null });
+    if (String(url).endsWith('/repos/isthealireza/SuperAgent')) return jsonResponse({ default_branch: 'main' });
+    if (String(url).includes('/pulls?')) return jsonResponse([{ node_id: 'PR_node', html_url: 'https://github.com/isthealireza/SuperAgent/pull/2' }]);
+    if (String(url).endsWith('/graphql')) return jsonResponse({ data: { enablePullRequestAutoMerge: { pullRequest: { autoMergeRequest: { enabledAt: '2026-11-07T00:00:00Z', mergeMethod: 'SQUASH' } } } } });
+    throw new Error(`Unexpected GitHub request ${url}`);
+  };
+  const result = await publishSuccessfulTask({
+    createPullRequest: true, autoMerge: true, githubOwner: 'isthealireza', githubRepo: 'SuperAgent', githubToken: 'test-token',
+  }, { issueNumber: null, title: 'Automate task', prompt: 'Implement the requested change.' },
+  { branch: 'agent/task-test-1234', changedFiles: ['README.md'] }, { fetchImpl, pushBranch: async () => {} });
+
+  assert.deepEqual(result.autoMerge, { enabled: true, enabledAt: '2026-11-07T00:00:00Z', mergeMethod: 'SQUASH' });
+  assert.match(calls.find(call => call.url.endsWith('/graphql')).body.query, /enablePullRequestAutoMerge/);
+  assert.equal(calls.some(call => call.method === 'PATCH' && call.url.includes('/pulls/')), false);
+});
+
 test('webhook registration binds the stable HTTPS endpoint and subscribes only to issue events', async () => {
   const calls = [];
   let currentHook = null;
